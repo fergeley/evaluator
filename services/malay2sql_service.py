@@ -3,7 +3,6 @@ import torch
 from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
-import openai
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,6 +11,9 @@ import json
 from collections import defaultdict
 from models.feedback import Feedback
 from database import SessionLocal
+from config import LLMConfig
+from services.llm import LLMClient, strip_code_fences
+import hashlib
 import os
 import uuid
 
@@ -23,6 +25,9 @@ class QueryResult:
     relevant_columns: Dict[str, str]
     execution_time: float
     timestamp: str
+    # Evaluator output: similarity to the closest golden query (1.0 = identical)
+    golden_score: Optional[float] = None
+    closest_golden_query: Optional[str] = None
 
 @dataclass
 class QueryFeedback:
@@ -30,38 +35,100 @@ class QueryFeedback:
     corrected_sql: str
     timestamp: str
 
+def normalize_sql(sql: str) -> str:
+    """Collapse whitespace and drop a trailing semicolon, so formatting alone
+    never changes a query's score."""
+    return " ".join(sql.split()).rstrip(";").strip()
+
+
+@dataclass(frozen=True)
+class GoldenMatch:
+    score: float          # 1.0 = identical to a golden query
+    golden_sql: str       # the closest golden query
+    db_id: Optional[str]  # the Spider database that golden query belongs to
+
+
 class GoldenQuery:
-    def __init__(self, schema_index, golden_query_path: str):
+    """Scores SQL by how closely it follows a set of golden (reference) queries.
+
+    Each golden query is embedded on its own. A query's score is its cosine
+    similarity to the closest golden query, so a golden query scores exactly
+    1.0. The score is deterministic: the same SQL always gets the same score.
+
+    The file format is one query per line, optionally followed by a tab and
+    the database id (Spider's gold-file format).
+    """
+
+    def __init__(self, schema_index, golden_query_path: str, cache_dir: Optional[str] = None):
         self.logger = logging.getLogger(__name__)
         self.logger.info(f"Initializing GoldenQuery with path: {golden_query_path}")
         self.encoder = schema_index.encoder
-        self.golden_query_embedding = self._encode_query(self._load_golden_query(golden_query_path))
-        self.logger.info("GoldenQuery initialized successfully")
+        self.golden_queries, self.db_ids = self._load_golden_queries(golden_query_path)
+        self._exact = {normalize_sql(q).casefold(): i for i, q in enumerate(self.golden_queries)}
+        self.golden_embeddings = self._load_or_encode(golden_query_path, cache_dir)
+        self.logger.info(f"GoldenQuery initialized with {len(self.golden_queries)} golden queries")
 
-    def _load_golden_query(self, path: str) -> str:
-        self.logger.info(f"Loading golden query from: {path}")
+    def _load_golden_queries(self, path: str) -> Tuple[List[str], List[Optional[str]]]:
+        self.logger.info(f"Loading golden queries from: {path}")
+        queries, db_ids = [], []
+        with open(path, 'r', encoding='utf-8') as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                sql, _, db_id = line.partition('\t')
+                queries.append(normalize_sql(sql))
+                db_ids.append(db_id.strip() or None)
+        if not queries:
+            raise ValueError(f"No golden queries found in {path}")
+        return queries, db_ids
+
+    def _encode(self, texts: List[str]) -> np.ndarray:
+        # Unit-length rows, so a dot product is the cosine similarity.
+        return self.encoder.encode(
+            texts, batch_size=256, convert_to_numpy=True, normalize_embeddings=True
+        ).astype(np.float32)
+
+    def _load_or_encode(self, path: str, cache_dir: Optional[str]) -> np.ndarray:
+        # Encoding ~9k queries takes a while on CPU, so cache the matrix next
+        # to the golden file, keyed by its contents and the encoder.
+        with open(path, 'rb') as f:
+            digest = hashlib.sha1(f.read()).hexdigest()[:12]
+        model_name = getattr(self.encoder, 'model_card_data', None)
+        model_name = getattr(model_name, 'base_model', None) or 'encoder'
+        cache_dir = cache_dir or os.path.dirname(os.path.abspath(path))
+        cache_file = os.path.join(
+            cache_dir, f".golden_{digest}_{str(model_name).replace('/', '_')}.npy"
+        )
+        if os.path.exists(cache_file):
+            embeddings = np.load(cache_file)
+            if embeddings.shape[0] == len(self.golden_queries):
+                self.logger.info(f"Loaded golden embeddings from {cache_file}")
+                return embeddings
+        embeddings = self._encode(self.golden_queries)
         try:
-            with open(path, 'r') as file:
-                query = file.read().strip()
-            self.logger.info("Golden query loaded successfully")
-            return query
-        except Exception as e:
-            self.logger.error(f"Failed to load golden query: {str(e)}")
-            raise
+            np.save(cache_file, embeddings)
+        except OSError as e:
+            self.logger.warning(f"Could not cache golden embeddings: {e}")
+        return embeddings
 
-    def _encode_query(self, query: str):
-        # Encode a query
-        return self.encoder.encode([query])[0]
+    def best_match(self, query: str) -> GoldenMatch:
+        normalized = normalize_sql(query)
+        exact = self._exact.get(normalized.casefold())
+        if exact is not None:
+            return GoldenMatch(1.0, self.golden_queries[exact], self.db_ids[exact])
+        similarities = self.golden_embeddings @ self._encode([normalized])[0]
+        best = int(np.argmax(similarities))
+        score = float(min(similarities[best], 1.0))
+        return GoldenMatch(score, self.golden_queries[best], self.db_ids[best])
 
     def calculate_cosine_similarity(self, query: str) -> float:
-        # Calculate the cosine similarity between a given query and the golden query.
-        query_embedding = self._encode_query(query)
-        return np.dot(query_embedding, self.golden_query_embedding) / (
-            np.linalg.norm(query_embedding) * np.linalg.norm(self.golden_query_embedding)
-        )
+        """Similarity of the query to its closest golden query (1.0 = identical)."""
+        return self.best_match(query).score
 
     def rerank_queries(self, sql_queries: list) -> list:
-        # Rerank a list of SQL queries based on their cosine similarity to the golden query.
+        """Sort candidate SQL queries by their golden score, best first.
+        Returns (query, score) pairs."""
         query_scores = [(query, self.calculate_cosine_similarity(query)) for query in sql_queries]
         return sorted(query_scores, key=lambda x: x[1], reverse=True)
 
@@ -112,16 +179,15 @@ class SchemaIndex:
 class Malay2SQLService:
     def __init__(
         self,
-        openai_api_key: str,
+        llm_config: LLMConfig,
         cache_client: Optional[Any] = None,
         logger: Optional[logging.Logger] = None
     ):
         self.logger = logger or logging.getLogger(__name__)
         self.logger.info("Initializing Malay2SQLService")
         
-        # OpenAI setup
-        self.openai_api_key = openai_api_key
-        openai.api_key = openai_api_key
+        # LLM setup (OpenAI or Gemini, see config.Settings)
+        self.llm = LLMClient(llm_config)
         
         # Device setup
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -290,7 +356,7 @@ class Malay2SQLService:
         schema: str,
         relevant_columns: Dict[str, str]
     ) -> str:
-        """Generate SQL query using OpenAI with context and feedback history"""
+        """Generate SQL query using the configured LLM with context and feedback history"""
         
         # Create columns_context before using it in prompt
         columns_context = "\n".join([
@@ -324,10 +390,8 @@ class Malay2SQLService:
     Return only the raw SQL query without markdown formatting or backticks.
     """
         
-        client = openai.OpenAI(api_key=self.openai_api_key)
-        print(prompt)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        self.logger.debug(prompt)
+        content = self.llm.chat(
             messages=[
                 {"role": "system", "content": "You are a SQL expert. Generate precise SQL queries focusing on the relevant columns provided. Return only the raw SQL query without markdown formatting or backticks."},
                 {"role": "user", "content": prompt}
@@ -336,11 +400,8 @@ class Malay2SQLService:
             max_tokens=500
         )
         
-        sql_query = response.choices[0].message.content
         # Strip markdown formatting if present
-        sql_query = sql_query.replace('```sql\n', '').replace('\n```', '').strip()
-        
-        return sql_query
+        return strip_code_fences(content)
 
     def _get_relevant_feedback(self, query: str, max_examples: int = 3) -> List[QueryFeedback]:
         """Get relevant feedback examples based on query similarity - shared across users"""
@@ -398,18 +459,24 @@ class Malay2SQLService:
                 relevant_columns
             )
             self.logger.info(f"Generated SQL query: {sql_query}")
-            
+
+            # Score the final query against the golden queries
+            match = self.golden_query.best_match(sql_query)
+            self.logger.info(f"Golden score: {match.score:.3f} (closest: {match.golden_sql})")
+
             # Create result
             execution_time = (datetime.now() - start_time).total_seconds()
             self.logger.info(f"Query processed in {execution_time:.2f} seconds")
-            
+
             result = QueryResult(
                 malay_query=malay_query,
                 english_translation=english_translation,
                 sql_query=sql_query,
                 relevant_columns=relevant_columns,
                 execution_time=execution_time,
-                timestamp=datetime.now().isoformat()
+                timestamp=datetime.now().isoformat(),
+                golden_score=match.score,
+                closest_golden_query=match.golden_sql
             )
             
             # Cache result

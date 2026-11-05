@@ -8,14 +8,32 @@ from unittest.mock import Mock, patch
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from services.malay2sql_service import translate_malay_to_english, initialize_translator
+from config import LLMConfig
+from services.malay2sql_service import Malay2SQLService
+
+# Translation runs on the local nanot5 model and never calls the LLM,
+# so the service gets a placeholder LLM config here.
+_service = None
+
+
+def initialize_translator() -> Malay2SQLService:
+    global _service
+    if _service is None:
+        _service = Malay2SQLService(
+            LLMConfig(provider="openai", api_key="unused", model="unused")
+        )
+    return _service
+
+
+def translate_malay_to_english(text):
+    return initialize_translator().translate_malay_to_english(text)
 
 # Unit Tests
 def test_translator_initialization():
     """Unit test to verify translator initialization"""
     translator = initialize_translator()
     assert translator is not None
-    assert hasattr(translator, 'translate')
+    assert hasattr(translator, 'translate_malay_to_english')
 
 def test_invalid_input():
     """Unit test for invalid inputs"""

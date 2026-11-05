@@ -7,6 +7,7 @@ import pandas as pd
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.insight import Insight
+from config import Settings
 
 # Load environment variables
 load_dotenv()
@@ -15,7 +16,7 @@ async def main():
     # Initialize with SQLite for testing
     insight = Insight(
         db_url='sqlite:///test.db',
-        openai_api_key=os.getenv("OPENAI_API_KEY")
+        llm_config=Settings().llm_config()
     )
     
     try:

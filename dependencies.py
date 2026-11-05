@@ -32,6 +32,6 @@ def get_malay2sql_service() -> Malay2SQLService:
         redis_client = None
         
     return Malay2SQLService(
-        openai_api_key=settings.openai_api_key,
+        llm_config=settings.llm_config(),
         cache_client=redis_client
     ) 

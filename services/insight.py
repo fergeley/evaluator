@@ -1,6 +1,7 @@
 import pandas as pd
 from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, Float, DateTime
 from services.malay2sql_service import Malay2SQLService
+from config import LLMConfig
 from typing import Dict, Any
 import logging
 import datetime
@@ -8,11 +9,11 @@ import time
 import sqlalchemy as sa
 
 class Insight:
-    def __init__(self, db_url: str, openai_api_key: str, cache_client=None):
+    def __init__(self, db_url: str, llm_config: LLMConfig, cache_client=None):
         # Use SQLite for testing if no db_url is provided
         self.db_url = db_url or 'sqlite:///test.db'
         self.engine = create_engine(self.db_url)
-        self.malay2sql_service = Malay2SQLService(openai_api_key, cache_client)
+        self.malay2sql_service = Malay2SQLService(llm_config, cache_client)
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.DEBUG)
         handler = logging.StreamHandler()
@@ -259,9 +260,9 @@ class Insight:
             return False
 
 # Example usage:
-# insight = Insight(db_url="your_database_url", openai_api_key="your_openai_api_key")
+# insight = Insight(db_url="your_database_url", llm_config=Settings().llm_config())
 # trends_df = await insight.get_top_trends()
 
 # Example usage:
-# insight = Insight(db_url="your_database_url", openai_api_key="your_openai_api_key")
+# insight = Insight(db_url="your_database_url", llm_config=Settings().llm_config())
 # trends_df = await insight.get_top_trends()

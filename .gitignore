@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+.env
 # C extensions
 *.so
 
@@ -102,3 +102,6 @@ key.json
 
 # Rope project settings
 .ropeproject
+
+# cached golden-query embeddings
+data/.golden_*.npy

@@ -4,14 +4,26 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from services.malay2sql_service import Malay2SQLService
-from dependencies import get_settings
+from config import Settings
 import time
 from datetime import datetime
 import pytest
 import asyncio
 
-@pytest.mark.asyncio
-async def test_malay2sql_service():
+USER_ID = "test-user"
+
+
+def _llm_config_or_skip():
+    try:
+        return Settings().llm_config()
+    except ValueError as e:
+        pytest.skip(f"needs an LLM key: {e}")
+
+def test_malay2sql_service():
+    asyncio.run(_run_pipeline())
+
+
+async def _run_pipeline():
     
     
     # Print GPU information
@@ -24,9 +36,8 @@ async def test_malay2sql_service():
     print("-" * 50)
 
     # Initialize service
-    settings = get_settings()
     service = Malay2SQLService(
-        openai_api_key=settings.openai_api_key,
+        llm_config=_llm_config_or_skip(),
         cache_client=None  # Disable cache for testing
     )
 
@@ -55,7 +66,7 @@ async def test_malay2sql_service():
 
     # Initialize schema
     print("\nInitializing schema...")
-    service.initialize_schema(test_schema)
+    service.initialize_schema(test_schema, user_id=USER_ID)
     print("Schema initialized successfully")
     print("-" * 50)
 
@@ -77,7 +88,7 @@ async def test_malay2sql_service():
         start_time = time.time()
         
         # Process query
-        result = await service.process_query(malay_query)
+        result = await service.process_query(malay_query, user_id=USER_ID)
         
         # Print results
         print(f"English Translation: {result.english_translation}")
@@ -106,4 +117,4 @@ async def test_malay2sql_service():
         assert datetime.fromisoformat(result.timestamp)
 
 if __name__ == "__main__":
-    asyncio.run(test_malay2sql_service())
+    asyncio.run(_run_pipeline())

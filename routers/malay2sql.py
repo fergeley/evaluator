@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from routers.auth import get_current_user
 from models.user import UserDB
 from datetime import datetime
-import openai
+from services.llm import strip_code_fences
 import json
 import random
 
@@ -38,8 +38,7 @@ async def execute_query(
 ):
     """Execute a SQL query"""
     try:
-        # Use OpenAI to generate mock results
-        client = openai.OpenAI(api_key=service.openai_api_key)
+        # Use the LLM to generate mock results (the SQL is not run against a database)
         
         prompt = f"""Given the SQL query below, generate realistic mock results in JSON format.
         The results should be consistent with a university staff database.
@@ -51,8 +50,7 @@ async def execute_query(
         Limit the results to 5 rows maximum.
         """
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        content = service.llm.chat(
             messages=[
                 {"role": "system", "content": "You are a SQL database simulator. Generate realistic mock results for SQL queries."},
                 {"role": "user", "content": prompt}
@@ -62,7 +60,9 @@ async def execute_query(
 
         # Parse the mock results
         try:
-            mock_results = json.loads(response.choices[0].message.content)
+            mock_results = json.loads(strip_code_fences(content))
+            if not isinstance(mock_results, list):
+                mock_results = [mock_results]
         except json.JSONDecodeError:
             mock_results = []
 

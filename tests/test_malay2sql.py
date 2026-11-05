@@ -29,8 +29,14 @@ def test_endpoints_with_token():
     token = get_test_token()
     headers = {"Authorization": f"Bearer {token}"}
 
-    # Test initialize endpoint
-    schema_data = {"schema": {"table": "test"}}
+    # Test initialize endpoint (same shape the frontend uploads)
+    schema_data = {"schema": {
+        "table_name": "users",
+        "columns": {
+            "id": {"data_type": "Int64", "description": "Unique identifier for each user"},
+            "name": {"data_type": "String", "description": "Full name of the user"},
+        },
+    }}
     response = client.post("/malay2sql/initialize", json=schema_data, headers=headers)
     assert response.status_code == 200
 
